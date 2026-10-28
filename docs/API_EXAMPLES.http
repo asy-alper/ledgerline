@@ -1,0 +1,199 @@
+# VS Code REST Client veya JetBrains HTTP Client ile adım adım çalıştırılabilir.
+# Önce .env ayarları ve README'deki kurulum tamamlanmalıdır.
+# Aşağıdaki parola/token yer tutucularını yerel olarak doldurun; gerçek sırları Git'e eklemeyin.
+# Admin e-postası/parolası uygulama başlatılırken verilen BOOTSTRAP_ADMIN_* ile aynı olmalıdır.
+# Aynı örnek kaydı tekrar çalıştırırsanız 409 EMAIL_ALREADY_REGISTERED beklenir.
+@baseUrl = http://localhost:8080
+@aliceEmail = alice@example.test
+@bobEmail = bob@example.test
+@alicePassword = REPLACE_WITH_LOCAL_PASSWORD_12_TO_128_CHARS
+@bobPassword = REPLACE_WITH_LOCAL_PASSWORD_12_TO_128_CHARS
+@adminEmail = REPLACE_WITH_BOOTSTRAP_ADMIN_EMAIL
+@adminPassword = REPLACE_WITH_BOOTSTRAP_ADMIN_PASSWORD
+@aliceToken = REPLACE_WITH_ALICE_LOGIN_RESPONSE_TOKEN
+@bobToken = REPLACE_WITH_BOB_LOGIN_RESPONSE_TOKEN
+@adminToken = REPLACE_WITH_ADMIN_LOGIN_RESPONSE_TOKEN
+@aliceAccountId = REPLACE_WITH_ALICE_ACCOUNT_RESPONSE_ID
+@bobAccountId = REPLACE_WITH_BOB_ACCOUNT_RESPONSE_ID
+@transferId = REPLACE_WITH_TRANSFER_RESPONSE_ID
+
+### 1. Servis ve PostgreSQL hazır mı? 200 UP beklenir.
+GET {{baseUrl}}/health/ready
+
+### 2. Alice kaydı. Rol her zaman USER olur. 201 beklenir.
+POST {{baseUrl}}/v1/auth/register
+Content-Type: application/json
+
+{
+  "email": "{{aliceEmail}}",
+  "fullName": "Alice Örnek",
+  "password": "{{alicePassword}}"
+}
+
+### 3. Bob kaydı. 201 beklenir.
+POST {{baseUrl}}/v1/auth/register
+Content-Type: application/json
+
+{
+  "email": "{{bobEmail}}",
+  "fullName": "Bob Örnek",
+  "password": "{{bobPassword}}"
+}
+
+### 4. Alice oturumu. token değerini aliceToken değişkenine kopyalayın.
+POST {{baseUrl}}/v1/auth/login
+Content-Type: application/json
+
+{
+  "email": "{{aliceEmail}}",
+  "password": "{{alicePassword}}"
+}
+
+### 5. Bob oturumu. token değerini bobToken değişkenine kopyalayın.
+POST {{baseUrl}}/v1/auth/login
+Content-Type: application/json
+
+{
+  "email": "{{bobEmail}}",
+  "password": "{{bobPassword}}"
+}
+
+### 6. Başlangıçta oluşturulan admin ile giriş. token değerini adminToken değişkenine kopyalayın.
+POST {{baseUrl}}/v1/auth/login
+Content-Type: application/json
+
+{
+  "email": "{{adminEmail}}",
+  "password": "{{adminPassword}}"
+}
+
+### 7. Alice TRY hesabı. id değerini aliceAccountId değişkenine kopyalayın.
+POST {{baseUrl}}/v1/accounts
+Authorization: Bearer {{aliceToken}}
+Content-Type: application/json
+
+{
+  "label": "Günlük harcamalar",
+  "currency": "TRY"
+}
+
+### 8. Bob TRY hesabı. id değerini bobAccountId değişkenine kopyalayın.
+POST {{baseUrl}}/v1/accounts
+Authorization: Bearer {{bobToken}}
+Content-Type: application/json
+
+{
+  "label": "Birikim",
+  "currency": "TRY"
+}
+
+### 9. Admin, dışarıda doğrulanan 1000 TRY fonlamayı kaydeder. İlk istek 201, tekrar 200.
+# reference sadece açıklamadır; dış olayın sabit kimliğini anahtarda koruyun.
+POST {{baseUrl}}/v1/admin/credits
+Authorization: Bearer {{adminToken}}
+Idempotency-Key: demo-settlement-00000001
+Content-Type: application/json
+
+{
+  "destinationAccountId": "{{aliceAccountId}}",
+  "amount": "1000.00",
+  "reference": "Dış mutabakat örnek kaydı 00000001"
+}
+
+### 10. Alice -> Bob 125.50 TRY. İlk istek 201; id değerini transferId'ye kopyalayın.
+POST {{baseUrl}}/v1/transfers
+Authorization: Bearer {{aliceToken}}
+Idempotency-Key: demo-transfer-00000001
+Content-Type: application/json
+
+{
+  "sourceAccountId": "{{aliceAccountId}}",
+  "destinationAccountId": "{{bobAccountId}}",
+  "amount": "125.50",
+  "description": "Akşam yemeği paylaşımı"
+}
+
+### 11. AYNI istek ve AYNI anahtar. 200, Idempotent-Replayed:true; ikinci kez para gitmez.
+POST {{baseUrl}}/v1/transfers
+Authorization: Bearer {{aliceToken}}
+Idempotency-Key: demo-transfer-00000001
+Content-Type: application/json
+
+{
+  "sourceAccountId": "{{aliceAccountId}}",
+  "destinationAccountId": "{{bobAccountId}}",
+  "amount": "125.50",
+  "description": "Akşam yemeği paylaşımı"
+}
+
+### 12. Aynı anahtar ile farklı tutar. 409 IDEMPOTENCY_CONFLICT; bakiye değişmez.
+POST {{baseUrl}}/v1/transfers
+Authorization: Bearer {{aliceToken}}
+Idempotency-Key: demo-transfer-00000001
+Content-Type: application/json
+
+{
+  "sourceAccountId": "{{aliceAccountId}}",
+  "destinationAccountId": "{{bobAccountId}}",
+  "amount": "126.00",
+  "description": "Akşam yemeği paylaşımı"
+}
+
+### 13. Yetersiz bakiye. 422 INSUFFICIENT_FUNDS; kısmi para hareketi oluşmaz.
+POST {{baseUrl}}/v1/transfers
+Authorization: Bearer {{aliceToken}}
+Idempotency-Key: demo-insufficient-0001
+Content-Type: application/json
+
+{
+  "sourceAccountId": "{{aliceAccountId}}",
+  "destinationAccountId": "{{bobAccountId}}",
+  "amount": "99999.00",
+  "description": "Rollback örneği"
+}
+
+### 14. Alice bakiyesi transferden sonra 874.50 TRY olmalıdır.
+GET {{baseUrl}}/v1/accounts/{{aliceAccountId}}
+Authorization: Bearer {{aliceToken}}
+
+### 15. Bob kendi işlem geçmişini görebilir; Alice'in hesabına erişirse 404 alır.
+GET {{baseUrl}}/v1/accounts/{{bobAccountId}}/transactions?limit=20&offset=0
+Authorization: Bearer {{bobToken}}
+
+### 16. Admin telafi kaydı oluşturur. İki bakiye eski haline döner; orijinal işlem silinmez.
+POST {{baseUrl}}/v1/admin/transfers/{{transferId}}/reversal
+Authorization: Bearer {{adminToken}}
+Idempotency-Key: demo-reversal-00000001
+Content-Type: application/json
+
+{
+  "reason": "Müşteri desteği tarafından onaylanan iade"
+}
+
+### 17. Orijinal işlem artık REVERSED durumunda görünür.
+GET {{baseUrl}}/v1/transfers/{{transferId}}
+Authorization: Bearer {{aliceToken}}
+
+### 18. Hesap dondurma. Bu hesaba olağan transfer giriş/çıkışı 409 alır.
+PATCH {{baseUrl}}/v1/admin/accounts/{{bobAccountId}}/status
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{
+  "status": "FROZEN"
+}
+
+### 19. Mutabakat balanced:true, mismatches:[], invalidTransfers:0 beklenir.
+GET {{baseUrl}}/v1/admin/reconciliation
+Authorization: Bearer {{adminToken}}
+
+### 20. Alice oturumunu iptal et. 204 beklenir.
+POST {{baseUrl}}/v1/auth/logout
+Authorization: Bearer {{aliceToken}}
+
+### 21. İptal edilen token artık 401 alır.
+GET {{baseUrl}}/v1/me
+Authorization: Bearer {{aliceToken}}
+
+### 22. Tam OpenAPI belgesi herkese açıktır.
+GET {{baseUrl}}/openapi.yaml

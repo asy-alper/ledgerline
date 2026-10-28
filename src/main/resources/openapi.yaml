@@ -1,0 +1,792 @@
+openapi: 3.1.1
+info:
+  title: LedgerLine API
+  version: 1.0.0
+  description: |
+    Spring kullanmadan Java ve PostgreSQL ile çalışan cüzdan ve transfer API'si.
+    JSON gövdeleri en fazla 16 KiB olabilir; tanımsız veya tekrarlanan JSON alanları reddedilir.
+    Para değerleri JSON metni olarak gönderilir ve iki ondalık basamaklı metin olarak döner.
+    TRY, USD ve EUR ayrı defterlerdir; para birimi dönüşümü yapılmaz.
+
+    Finansal POST isteklerinde Idempotency-Key zorunludur. Anahtar kullanıcı genelinde
+    kalıcı olarak saklanır; aynı normalleştirilmiş işlem yeniden gönderilirse aynı işlem
+    kimliği ve güncel durumu 200, Idempotent-Replayed:true ile döner.
+    Aynı anahtarın farklı işlemde kullanımı 409 üretir.
+    Başarısız olup geri alınan işlemler anahtarı tüketmez. Bağlantı kesildiğinde veya 503
+    alındığında aynı gövdeyi AYNI anahtarla yeniden gönderin. Yeni anahtar yeni talimat demektir.
+
+    Tüm yanıtlarda X-Request-Id ve Cache-Control:no-store bulunur. Hatalar
+    application/problem+json biçimindedir. Desteklenmeyen yöntem 405 (Allow başlığıyla),
+    2048 karakteri aşan adres 414 ve beklenmeyen sunucu hatası 500 üretebilir.
+    İnternet erişiminde API'yi HTTPS sonlandıran bir ters vekilin arkasında çalıştırın.
+servers:
+  - url: http://localhost:8080
+    description: Yerel geliştirme; üretim URL'sini HTTPS olarak değiştirin.
+security:
+  - bearerAuth: []
+tags:
+  - name: Health
+  - name: Auth
+  - name: Accounts
+  - name: Transfers
+  - name: Admin
+paths:
+  /health/live:
+    get:
+      operationId: liveness
+      tags: [Health]
+      summary: HTTP sürecinin çalıştığını kontrol eder.
+      security: []
+      responses:
+        '200': { $ref: '#/components/responses/Healthy' }
+        default: { $ref: '#/components/responses/OtherError' }
+  /health/ready:
+    get:
+      operationId: readiness
+      tags: [Health]
+      summary: PostgreSQL bağlantısının kullanılabilir olduğunu kontrol eder.
+      security: []
+      responses:
+        '200': { $ref: '#/components/responses/Healthy' }
+        '503':
+          description: Veritabanına erişilemiyor.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+              example: { status: DOWN }
+        default: { $ref: '#/components/responses/OtherError' }
+  /openapi.yaml:
+    get:
+      operationId: openApiDocument
+      tags: [Health]
+      summary: Bu OpenAPI belgesini döndürür.
+      security: []
+      responses:
+        '200':
+          description: OpenAPI 3.1 YAML belgesi.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/yaml:
+              schema: { type: string }
+        default: { $ref: '#/components/responses/OtherError' }
+  /v1/auth/register:
+    post:
+      operationId: register
+      tags: [Auth]
+      summary: USER rolünde yeni kullanıcı oluşturur.
+      description: E-posta küçük harfe çevrilir. Rol istemciden alınmaz; kayıt otomatik oturum açmaz.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+      responses:
+        '201':
+          description: Kullanıcı oluşturuldu.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/BodyTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/OtherError' }
+  /v1/auth/login:
+    post:
+      operationId: login
+      tags: [Auth]
+      summary: Bir saat geçerli, iptal edilebilir oturum oluşturur.
+      description: |
+        Token sadece bu yanıtta açık olarak döner; veritabanında SHA-256 özeti tutulur.
+        Yanlış e-posta ve yanlış parola aynı INVALID_CREDENTIALS yanıtını üretir.
+        On beş dakikalık pencerede e-posta için 10, doğrudan bağlantı IP'si için 60 deneme sınırı vardır.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Oturum açıldı.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/BodyTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/OtherError' }
+  /v1/auth/logout:
+    post:
+      operationId: logout
+      tags: [Auth]
+      summary: Gönderilen Bearer oturumunu iptal eder.
+      description: Diğer cihazların oturumları etkilenmez. İptal edilmiş token yeniden kullanılırsa 401 döner.
+      responses:
+        '204':
+          description: Oturum iptal edildi; yanıt gövdesi yoktur.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/OtherError' }
+  /v1/me:
+    get:
+      operationId: currentUser
+      tags: [Auth]
+      summary: Oturum sahibinin güncel bilgilerini ve rolünü döndürür.
+      responses:
+        '200':
+          description: Oturum sahibi.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/OtherError' }
+  /v1/accounts:
+    get:
+      operationId: listAccounts
+      tags: [Accounts]
+      summary: Oturum sahibinin hesaplarını en yeniden eskiye listeler.
+      description: ADMIN için de sadece kendi hesaplarını listeler; sistem hazineleri listeye eklenmez.
+      responses:
+        '200':
+          description: Kullanıcının hesapları; hesap yoksa boş dizi.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Account' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/OtherError' }
+    post:
+      operationId: createAccount
+      tags: [Accounts]
+      summary: Sıfır bakiyeli ACTIVE hesap açar.
+      description: Sahip her zaman oturum sahibidir. Başlangıç bakiyesi ve sahip bilgisi istemciden alınmaz.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateAccountRequest' }
+      responses:
+        '201':
+          description: Hesap oluşturuldu.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Account' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/BodyTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/OtherError' }
+  /v1/accounts/{accountId}:
+    parameters:
+      - { $ref: '#/components/parameters/AccountId' }
+    get:
+      operationId: getAccount
+      tags: [Accounts]
+      summary: Hesap ayrıntısını ve güncel bakiyeyi döndürür.
+      description: Hesap sahibi veya ADMIN okuyabilir. Başkasının hesabı USER için 404 döner.
+      responses:
+        '200':
+          description: Hesap bilgileri.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Account' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/OtherError' }
+  /v1/accounts/{accountId}/transactions:
+    parameters:
+      - { $ref: '#/components/parameters/AccountId' }
+    get:
+      operationId: accountTransactions
+      tags: [Accounts, Transfers]
+      summary: Hesabın gelen ve giden işlem geçmişini sayfalar.
+      description: |
+        Hesap sahibi veya ADMIN okuyabilir. Fonlama ve telafi işlemleri de geçmiştedir.
+        Sıralama createdAt DESC, id DESC şeklindedir. Devam eden yeni işlemler offset sayfalarını kaydırabilir.
+        Sorguda tanımsız veya tekrarlanan parametreler reddedilir.
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, maximum: 1000000, default: 0 }
+      responses:
+        '200':
+          description: İşlem sayfası.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransferPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/OtherError' }
+  /v1/transfers:
+    post:
+      operationId: transfer
+      tags: [Transfers]
+      summary: Aynı para birimindeki iki müşteri hesabı arasında atomik transfer yapar.
+      description: |
+        Kaynak hesabın sahibi olmanız gerekir; ADMIN de başka kullanıcı adına bu uçtan para gönderemez.
+        İki hesap farklı, ACTIVE ve aynı para biriminde olmalıdır. Kaynak bakiye eksiye düşemez.
+        Bakiye değişiklikleri, çift taraflı defter, denetim ve tekrar önleme kaydı tek transaction içinde commit edilir.
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransferRequest' }
+      responses:
+        '201': { $ref: '#/components/responses/CreatedTransfer' }
+        '200': { $ref: '#/components/responses/ReplayedTransfer' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/BodyTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/OtherError' }
+  /v1/transfers/{transferId}:
+    parameters:
+      - { $ref: '#/components/parameters/TransferId' }
+    get:
+      operationId: getTransfer
+      tags: [Transfers]
+      summary: Gönderen, alıcı veya ADMIN için işlem ayrıntısını döndürür.
+      description: Başarılı telafi işleminden sonra orijinal işlemin hesaplanan durumu REVERSED olur.
+      responses:
+        '200':
+          description: İşlem bilgileri.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transfer' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/OtherError' }
+  /v1/admin/credits:
+    post:
+      operationId: recordFunding
+      tags: [Admin]
+      summary: Dışarıda doğrulanmış fonlamayı sistem hazinesinden müşteri hesabına kaydeder.
+      description: |
+        Yalnız ADMIN. Bu uç banka veya ödeme sağlayıcısı entegrasyonu değildir; yönetici
+        dış mutabakatı doğruladıktan sonra kullanır. reference otomatik benzersizleştirilmez;
+        dış olayın sabit kimliğini Idempotency-Key olarak kullanın. Hazine eksi bakiye taşıyabilir;
+        müşteri bakiyesi ve defter toplamı korunur. Hedef ACTIVE müşteri hesabı olmalıdır.
+      x-required-role: ADMIN
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreditRequest' }
+      responses:
+        '201': { $ref: '#/components/responses/CreatedTransfer' }
+        '200': { $ref: '#/components/responses/ReplayedTransfer' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/BodyTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/OtherError' }
+  /v1/admin/transfers/{transferId}/reversal:
+    parameters:
+      - { $ref: '#/components/parameters/TransferId' }
+    post:
+      operationId: reverseTransfer
+      tags: [Admin]
+      summary: Orijinal tutarı ters yönde yeni bir işlemle telafi eder.
+      description: |
+        Yalnız ADMIN. Orijinal kayıt silinmez veya değiştirilmez. Her orijinal işlem
+        en fazla bir kez telafi edilebilir; telafi işleminin kendisi telafi edilemez.
+        FROZEN hesaplar destek işlemiyle telafi edilebilir; CLOSED hesaplar kullanılamaz.
+        Orijinal alıcı parayı harcadıysa geri alma eksi bakiye yaratmaz ve 422 döner.
+        Bu, başarısız transaction'ın otomatik rollback işleminden farklı bir iş akışıdır.
+      x-required-role: ADMIN
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReversalRequest' }
+      responses:
+        '201': { $ref: '#/components/responses/CreatedTransfer' }
+        '200': { $ref: '#/components/responses/ReplayedTransfer' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/BodyTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/OtherError' }
+  /v1/admin/accounts/{accountId}/status:
+    parameters:
+      - { $ref: '#/components/parameters/AccountId' }
+    patch:
+      operationId: changeAccountStatus
+      tags: [Admin]
+      summary: Müşteri hesabını dondurur, etkinleştirir veya kalıcı kapatır.
+      description: |
+        Yalnız ADMIN. CLOSED için bakiye sıfır olmalıdır. Kapanan hesap yeniden açılamaz.
+        Sistem hazinelerinin durumu bu uçtan değiştirilemez.
+      x-required-role: ADMIN
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StatusRequest' }
+      responses:
+        '200':
+          description: Güncellenen hesap.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Account' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/BodyTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/OtherError' }
+  /v1/admin/reconciliation:
+    get:
+      operationId: reconcile
+      tags: [Admin]
+      summary: Tüm bakiye ve defter kayıtlarını tek tutarlı veritabanı görüntüsünden kontrol eder.
+      description: |
+        Yalnız ADMIN. balanced=false bir alarmdır; API bakiyeleri otomatik düzeltmez.
+        mismatches saklanan bakiye ile defter toplamı farklı olan hesapları listeler.
+        invalidTransfers eksik, dengesiz veya para birimi uyuşmayan işlemleri sayar.
+      x-required-role: ADMIN
+      responses:
+        '200':
+          description: Mutabakat sonucu.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Reconciliation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        default: { $ref: '#/components/responses/OtherError' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: Login yanıtındaki token. JWT değildir; sunucuda iptal edilebilir oturumdur.
+  parameters:
+    AccountId:
+      name: accountId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    TransferId:
+      name: transferId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Kullanıcı başına benzersiz sabit işlem anahtarı. Bir HTTP isteğinde tek başlık değeri olmalıdır.
+        Tekrar denemede aynı değeri koruyun; farklı işlem için yeni değer kullanın.
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+        pattern: '^[A-Za-z0-9._:-]{8,128}$'
+      example: settlement-2026-00000001
+  headers:
+    RequestId:
+      description: Sunucunun ürettiği istek kimliği; hata gövdesindeki requestId ile aynıdır.
+      schema: { type: string, format: uuid }
+    Replay:
+      description: true aynı isteğin daha önce commit edilmiş sonucunu, false yeni işlemi gösterir.
+      schema: { type: boolean }
+    Location:
+      description: Yeni veya tekrar döndürülen işlemin göreli adresi.
+      schema: { type: string, example: /v1/transfers/028d43c4-d356-4547-abd2-d826605fc729 }
+  schemas:
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: { type: string, enum: [UP, DOWN] }
+    Currency:
+      type: string
+      enum: [TRY, USD, EUR]
+    MoneyInput:
+      type: string
+      description: 0'dan büyük, en çok 999999999999.99; üs, virgül, işaret veya yuvarlama desteklenmez.
+      pattern: '^(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,2})?$'
+      not:
+        enum: ['0', '0.0', '0.00']
+      examples: ['125.50', '1', '0.01']
+    Money:
+      type: string
+      description: İki ondalık basamaklı kesin parasal değer. Sistem hazinesi eksi bakiye taşıyabilir.
+      pattern: '^-?(?:0|[1-9][0-9]{0,16})\.[0-9]{2}$'
+      examples: ['125.50', '0.00', '-125.50']
+    AccountStatus:
+      type: string
+      enum: [ACTIVE, FROZEN, CLOSED]
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      required: [email, fullName, password]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        fullName: { type: string, minLength: 2, maxLength: 100 }
+        password: { type: string, minLength: 12, maxLength: 128, writeOnly: true }
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        password: { type: string, maxLength: 128, writeOnly: true }
+    User:
+      type: object
+      additionalProperties: false
+      required: [id, email, fullName, role]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        fullName: { type: string }
+        role: { type: string, enum: [USER, ADMIN] }
+    Session:
+      type: object
+      additionalProperties: false
+      required: [token, expiresAt, user]
+      properties:
+        token:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{43}$'
+          description: Bearer başlığında gönderilir; güvenli saklayın, loglamayın.
+        expiresAt: { type: string, format: date-time }
+        user: { $ref: '#/components/schemas/User' }
+    CreateAccountRequest:
+      type: object
+      additionalProperties: false
+      required: [label, currency]
+      properties:
+        label: { type: string, minLength: 1, maxLength: 60 }
+        currency: { $ref: '#/components/schemas/Currency' }
+    Account:
+      type: object
+      additionalProperties: false
+      required: [id, ownerId, label, currency, balance, status, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        ownerId:
+          type: [string, 'null']
+          format: uuid
+          description: Müşteri hesabında kullanıcı kimliği; ADMIN'in okuyabildiği sistem hazinesinde null.
+        label: { type: string }
+        currency: { $ref: '#/components/schemas/Currency' }
+        balance: { $ref: '#/components/schemas/Money' }
+        status: { $ref: '#/components/schemas/AccountStatus' }
+        createdAt: { type: string, format: date-time }
+    TransferRequest:
+      type: object
+      additionalProperties: false
+      required: [sourceAccountId, destinationAccountId, amount]
+      properties:
+        sourceAccountId: { type: string, format: uuid }
+        destinationAccountId: { type: string, format: uuid }
+        amount: { $ref: '#/components/schemas/MoneyInput' }
+        description: { type: string, maxLength: 200, default: '' }
+    CreditRequest:
+      type: object
+      additionalProperties: false
+      required: [destinationAccountId, amount, reference]
+      properties:
+        destinationAccountId: { type: string, format: uuid }
+        amount: { $ref: '#/components/schemas/MoneyInput' }
+        reference:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Globally unique verified external settlement reference, namespaced by provider. Reuse with another request key returns 409 SETTLEMENT_ALREADY_RECORDED.
+          example: bank-a:settlement-2026-1234
+    ReversalRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason: { type: string, minLength: 1, maxLength: 200 }
+    StatusRequest:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: { $ref: '#/components/schemas/AccountStatus' }
+    Transfer:
+      type: object
+      additionalProperties: false
+      required: [id, sourceAccountId, destinationAccountId, amount, currency, description, status, reversalOf, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        sourceAccountId: { type: string, format: uuid }
+        destinationAccountId: { type: string, format: uuid }
+        amount: { $ref: '#/components/schemas/Money' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        description: { type: string }
+        status: { type: string, enum: [COMPLETED, REVERSED] }
+        reversalOf:
+          type: [string, 'null']
+          format: uuid
+          description: Telafi işleminde orijinal işlem kimliği; diğer işlemlerde null.
+        createdAt: { type: string, format: date-time }
+    TransferPage:
+      type: object
+      additionalProperties: false
+      required: [items, limit, offset]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Transfer' }
+        limit: { type: integer, minimum: 1, maximum: 100 }
+        offset: { type: integer, minimum: 0, maximum: 1000000 }
+    BalanceMismatch:
+      type: object
+      additionalProperties: false
+      required: [accountId, balance, ledgerBalance]
+      properties:
+        accountId: { type: string, format: uuid }
+        balance: { $ref: '#/components/schemas/Money' }
+        ledgerBalance: { $ref: '#/components/schemas/Money' }
+    Reconciliation:
+      type: object
+      additionalProperties: false
+      required: [balanced, checkedAccounts, checkedTransfers, mismatches, invalidTransfers]
+      properties:
+        balanced: { type: boolean }
+        checkedAccounts: { type: integer, format: int64, minimum: 0 }
+        checkedTransfers: { type: integer, format: int64, minimum: 0 }
+        mismatches:
+          type: array
+          items: { $ref: '#/components/schemas/BalanceMismatch' }
+        invalidTransfers: { type: integer, format: int64, minimum: 0 }
+    Problem:
+      type: object
+      additionalProperties: false
+      required: [type, title, status, code, detail, requestId]
+      properties:
+        type: { type: string, const: 'about:blank' }
+        title: { type: string, description: Uygulamaya özgü hata koduyla aynıdır. }
+        status: { type: integer, minimum: 400, maximum: 599 }
+        code:
+          type: string
+          enum:
+            - INVALID_JSON
+            - INVALID_FIELD
+            - INVALID_ID
+            - INVALID_QUERY
+            - INVALID_IDEMPOTENCY_KEY
+            - INVALID_EMAIL
+            - INVALID_NAME
+            - INVALID_PASSWORD
+            - VALIDATION_ERROR
+            - UNAUTHORIZED
+            - INVALID_CREDENTIALS
+            - FORBIDDEN
+            - NOT_FOUND
+            - METHOD_NOT_ALLOWED
+            - EMAIL_ALREADY_REGISTERED
+            - IDEMPOTENCY_CONFLICT
+            - ACCOUNT_NOT_ACTIVE
+            - ACCOUNT_CLOSED
+            - ACCOUNT_NOT_EMPTY
+            - TRANSFER_ALREADY_REVERSED
+            - BODY_TOO_LARGE
+            - URI_TOO_LONG
+            - UNSUPPORTED_MEDIA_TYPE
+            - INSUFFICIENT_FUNDS
+            - CURRENCY_MISMATCH
+            - BALANCE_LIMIT
+            - AUTH_RATE_LIMITED
+            - DATABASE_UNAVAILABLE
+            - INTERNAL_ERROR
+        detail: { type: string, description: Kullanıcıya gösterilebilir açıklama; SQL ve stack trace içermez. }
+        requestId: { type: string, format: uuid }
+      example:
+        type: about:blank
+        title: INSUFFICIENT_FUNDS
+        status: 422
+        code: INSUFFICIENT_FUNDS
+        detail: Source account has insufficient available balance
+        requestId: 028d43c4-d356-4547-abd2-d826605fc729
+  responses:
+    Healthy:
+      description: Servis hazır.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Health' }
+          example: { status: UP }
+    CreatedTransfer:
+      description: Yeni finansal işlem atomik olarak commit edildi; Idempotent-Replayed false.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+        Idempotent-Replayed: { $ref: '#/components/headers/Replay' }
+        Location: { $ref: '#/components/headers/Location' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Transfer' }
+    ReplayedTransfer:
+      description: Mevcut işlemin güncel durumu döndürüldü; yeni para gönderilmedi, Idempotent-Replayed true.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+        Idempotent-Replayed: { $ref: '#/components/headers/Replay' }
+        Location: { $ref: '#/components/headers/Location' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Transfer' }
+    BadRequest:
+      description: JSON, UUID, sorgu, alan veya para biçimi geçersiz; pozitif tutar zorunludur.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Token yok, geçersiz, iptal edilmiş veya süresi dolmuş; girişte kimlik bilgileri hatalı olabilir.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+        WWW-Authenticate:
+          schema: { type: string, const: Bearer }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: ADMIN rolü veya kaynak hesap sahipliği gerekli.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Kayıt veya adres bulunamadı; kayıt kullanıcıya görünür olmayabilir.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: E-posta/anahtar çakışması, etkin olmayan hesap, kapanış kuralı veya daha önce telafi edilen işlem.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    BodyTooLarge:
+      description: JSON gövdesi 16 KiB sınırını aşıyor.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    UnsupportedMediaType:
+      description: Content-Type application/json olmalıdır.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unprocessable:
+      description: INSUFFICIENT_FUNDS, CURRENCY_MISMATCH veya BALANCE_LIMIT iş kuralı ihlali.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    RateLimited:
+      description: AUTH_RATE_LIMITED; veritabanında tutulan 15 dakikalık deneme penceresi doldu.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+        Retry-After:
+          schema: { type: integer, const: 900 }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unavailable:
+      description: |
+        Veritabanı işlemi tamamlanamadı. Para talimatında commit yanıtı kaybolmuş olabilir;
+        aynı gövde ve AYNI Idempotency-Key ile yeniden deneyin.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    OtherError:
+      description: Desteklenmeyen yöntem 405, uzun adres 414 veya beklenmeyen sunucu hatası 500.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+        Allow:
+          description: 405 yanıtında izin verilen HTTP yöntemleri.
+          schema: { type: string }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
