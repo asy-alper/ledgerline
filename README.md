@@ -243,7 +243,6 @@ docs/                       Design, operations, and request examples
 - [Verification report](docs/TEST_REPORT.md): test coverage and validation results.
 - [Learning path](docs/LEARNING_PATH.md): implementation walkthrough and a staged Spring Boot migration plan.
 
-The supporting guides and request annotations are currently written in Turkish.
 
 Planned development includes a Spring Boot HTTP adapter, improved observability, cursor-based history pagination, and payment-provider adapters. These are future extensions rather than features of the current release.
 
